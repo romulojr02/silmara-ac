@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { promisify } from 'node:util';
-import { nowIso, db } from './db.mjs';
+import { nowIso, pool, one, transaction } from './db.mjs';
 
 const scryptAsync = promisify(crypto.scrypt);
 
@@ -151,7 +151,7 @@ export function clearSessionCookie(req, res) {
   });
 }
 
-export function createSession(req, res) {
+export async function createSession(req, res) {
   const token = crypto.randomBytes(32).toString('base64url');
   const tokenHash = hashToken(token);
   const now = new Date();
@@ -159,75 +159,77 @@ export function createSession(req, res) {
   const id = crypto.randomUUID();
   const ipHash = crypto.createHash('sha256').update(String(req.ip ?? '')).digest('hex').slice(0, 24);
 
-  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now.toISOString());
-  db.prepare(
-    `
-    INSERT INTO sessions (id, token_hash, created_at, expires_at, last_seen, user_agent, ip_hash)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `,
-  ).run(
-    id,
-    tokenHash,
-    now.toISOString(),
-    expires.toISOString(),
-    now.toISOString(),
-    String(req.get('user-agent') ?? '').slice(0, 250),
-    ipHash,
-  );
+  await transaction(async (client) => {
+    await client.query('DELETE FROM sessions WHERE expires_at <= $1', [now.toISOString()]);
+    await client.query(
+      `
+      INSERT INTO sessions (id, token_hash, created_at, expires_at, last_seen, user_agent, ip_hash)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `,
+      [
+        id,
+        tokenHash,
+        now.toISOString(),
+        expires.toISOString(),
+        now.toISOString(),
+        String(req.get('user-agent') ?? '').slice(0, 250),
+        ipHash,
+      ],
+    );
 
-  const count = db.prepare('SELECT COUNT(*) AS n FROM sessions').get();
-  if (Number(count.n) > 20) {
-    db.prepare(
-      `DELETE FROM sessions WHERE id IN (
-        SELECT id FROM sessions ORDER BY created_at ASC LIMIT ?
-      )`,
-    ).run(Number(count.n) - 20);
-  }
+    const count = await client.query('SELECT COUNT(*) AS n FROM sessions');
+    const total = Number(count.rows[0].n);
+    if (total > 20) {
+      await client.query(
+        `DELETE FROM sessions WHERE id IN (
+          SELECT id FROM sessions ORDER BY created_at ASC LIMIT $1
+        )`,
+        [total - 20],
+      );
+    }
+  });
 
   setSessionCookie(req, res, token, SESSION_DAYS * 24 * 60 * 60);
   return { id, token, tokenHash, expiresAt: expires.toISOString() };
 }
 
-export function destroyCurrentSession(req, res) {
+export async function destroyCurrentSession(req, res) {
   const cookies = parseCookies(req.headers.cookie);
   const token = cookies[SESSION_COOKIE];
   if (token) {
-    db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
+    await pool.query('DELETE FROM sessions WHERE token_hash = $1', [hashToken(token)]);
   }
   clearSessionCookie(req, res);
 }
 
-export function revokeOtherSessions(req) {
+export async function revokeOtherSessions(req) {
   const cookies = parseCookies(req.headers.cookie);
   const token = cookies[SESSION_COOKIE];
   if (!token) return 0;
-  const result = db
-    .prepare('DELETE FROM sessions WHERE token_hash <> ?')
-    .run(hashToken(token));
-  return Number(result.changes);
+  const result = await pool.query('DELETE FROM sessions WHERE token_hash <> $1', [hashToken(token)]);
+  return Number(result.rowCount);
 }
 
-export function countSessions() {
-  const row = db.prepare('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?').get(nowIso());
+export async function countSessions() {
+  const row = await one('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > $1', [nowIso()]);
   return Number(row.n);
 }
 
-export function resolveSession(req, res) {
+export async function resolveSession(req, res) {
   const cookies = parseCookies(req.headers.cookie);
   const token = cookies[SESSION_COOKIE];
   if (!token) return null;
 
-  const row = db
-    .prepare(
-      `
-      SELECT s.id, s.expires_at, s.last_seen, s.created_at, a.name, a.created_at AS admin_created_at,
-        a.password_changed_at, a.recovery_hash
-      FROM sessions s
-      JOIN admin a ON a.id = 1
-      WHERE s.token_hash = ?
-    `,
-    )
-    .get(hashToken(token));
+  const row = await one(
+    `
+    SELECT s.id, s.expires_at, s.last_seen, s.created_at, a.name, a.created_at AS admin_created_at,
+      a.password_changed_at, a.recovery_hash
+    FROM sessions s
+    JOIN admin a ON a.id = 1
+    WHERE s.token_hash = $1
+  `,
+    [hashToken(token)],
+  );
 
   if (!row) {
     clearSessionCookie(req, res);
@@ -236,7 +238,7 @@ export function resolveSession(req, res) {
 
   const now = new Date();
   if (new Date(row.expires_at) <= now) {
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(row.id);
+    await pool.query('DELETE FROM sessions WHERE id = $1', [row.id]);
     clearSessionCookie(req, res);
     return null;
   }
@@ -244,14 +246,14 @@ export function resolveSession(req, res) {
   const remainingMs = new Date(row.expires_at).getTime() - now.getTime();
   if (remainingMs < (SESSION_DAYS - 1) * 24 * 60 * 60 * 1000) {
     const newExpiry = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000);
-    db.prepare('UPDATE sessions SET expires_at = ?, last_seen = ? WHERE id = ?').run(
+    await pool.query('UPDATE sessions SET expires_at = $1, last_seen = $2 WHERE id = $3', [
       newExpiry.toISOString(),
       now.toISOString(),
       row.id,
-    );
+    ]);
     setSessionCookie(req, res, token, SESSION_DAYS * 24 * 60 * 60);
   } else if (now.getTime() - new Date(row.last_seen).getTime() > 10 * 60 * 1000) {
-    db.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?').run(now.toISOString(), row.id);
+    await pool.query('UPDATE sessions SET last_seen = $1 WHERE id = $2', [now.toISOString(), row.id]);
   }
 
   return {
@@ -266,23 +268,27 @@ export function resolveSession(req, res) {
   };
 }
 
-export function requireAuth(req, res, next) {
-  const resolved = resolveSession(req, res);
-  if (!resolved) {
-    return res.status(401).json({ error: 'Sua sessão não está ativa. Entre novamente.' });
+export async function requireAuth(req, res, next) {
+  try {
+    const resolved = await resolveSession(req, res);
+    if (!resolved) {
+      return res.status(401).json({ error: 'Sua sessão não está ativa. Entre novamente.' });
+    }
+    req.admin = resolved.admin;
+    req.sessionId = resolved.sessionId;
+    req.sessionExpiresAt = resolved.sessionExpiresAt;
+    return next();
+  } catch (error) {
+    return next(error);
   }
-  req.admin = resolved.admin;
-  req.sessionId = resolved.sessionId;
-  req.sessionExpiresAt = resolved.sessionExpiresAt;
-  return next();
 }
 
-export function getThrottle(key) {
-  return db.prepare('SELECT * FROM auth_throttle WHERE key = ?').get(key) ?? null;
+export async function getThrottle(key) {
+  return one('SELECT * FROM auth_throttle WHERE key = $1', [key]);
 }
 
-export function throttleMessage(key) {
-  const row = getThrottle(key);
+export async function throttleMessage(key) {
+  const row = await getThrottle(key);
   if (!row || !row.locked_until) return null;
   const seconds = Math.ceil((new Date(row.locked_until).getTime() - Date.now()) / 1000);
   if (seconds <= 0) return null;
@@ -293,25 +299,26 @@ export function throttleMessage(key) {
   };
 }
 
-export function registerFailure(key) {
+export async function registerFailure(key) {
   const now = new Date();
-  const row = getThrottle(key);
+  const row = await getThrottle(key);
   const failures = (row?.failures ?? 0) + 1;
   let lockedUntil = null;
   if (failures >= 12) lockedUntil = new Date(now.getTime() + 6 * 60 * 60 * 1000);
   else if (failures >= 8) lockedUntil = new Date(now.getTime() + 30 * 60 * 1000);
   else if (failures >= 5) lockedUntil = new Date(now.getTime() + 5 * 60 * 1000);
 
-  db.prepare(
+  await pool.query(
     `
     INSERT INTO auth_throttle (key, failures, locked_until, updated_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(key) DO UPDATE SET
-      failures = excluded.failures,
-      locked_until = excluded.locked_until,
-      updated_at = excluded.updated_at
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (key) DO UPDATE SET
+      failures = EXCLUDED.failures,
+      locked_until = EXCLUDED.locked_until,
+      updated_at = EXCLUDED.updated_at
   `,
-  ).run(key, failures, lockedUntil ? lockedUntil.toISOString() : row?.locked_until ?? null, now.toISOString());
+    [key, failures, lockedUntil ? lockedUntil.toISOString() : row?.locked_until ?? null, now.toISOString()],
+  );
 
   if (lockedUntil) {
     const minutes = Math.max(1, Math.ceil((lockedUntil.getTime() - now.getTime()) / 60000));
@@ -320,8 +327,8 @@ export function registerFailure(key) {
   return { locked: false, failures };
 }
 
-export function clearFailures(key) {
-  db.prepare('DELETE FROM auth_throttle WHERE key = ?').run(key);
+export async function clearFailures(key) {
+  await pool.query('DELETE FROM auth_throttle WHERE key = $1', [key]);
 }
 
 export function clientKey(req, scope = 'login') {

@@ -1,4 +1,4 @@
-import { db, transaction, nowIso, todayStr, addDays, setMeta } from './db.mjs';
+import { transaction, nowIso, todayStr, addDays, setMeta } from './db.mjs';
 
 function mulberry32(seed) {
   let value = seed;
@@ -12,11 +12,11 @@ function mulberry32(seed) {
 }
 
 const TYPES = [
-  { name: 'Alimentos', color: '#b9643a' },
-  { name: 'Bebidas', color: '#3f7a8c' },
-  { name: 'Limpeza', color: '#7b8c5a' },
-  { name: 'Higiene', color: '#a0698b' },
-  { name: 'Congelados', color: '#5f7fa6' },
+  { name: 'Alimentos', color: '#b23b63' },
+  { name: 'Bebidas', color: '#8f6aa8' },
+  { name: 'Limpeza', color: '#c97b8e' },
+  { name: 'Higiene', color: '#7d8fb3' },
+  { name: 'Congelados', color: '#6f9c8c' },
 ];
 
 const PRODUCTS = [
@@ -66,7 +66,7 @@ const SAIDA_NOTES = [
 
 const ENTRADA_NOTES = ['Compra mensal', 'Reposição de estoque', 'Pedido de reposição', ''];
 
-export function loadDemo() {
+export async function loadDemo() {
   const random = mulberry32(20261023);
   const randInt = (min, max) => Math.floor(random() * (max - min + 1)) + min;
   const pick = (list) => list[Math.floor(random() * list.length)];
@@ -79,19 +79,21 @@ export function loadDemo() {
   const startDate = todayStr(start);
   const stamp = nowIso();
 
-  transaction(() => {
+  await transaction(async (client) => {
     const typeIds = new Map();
-    const findType = db.prepare('SELECT id FROM types WHERE name = ? COLLATE NOCASE');
     for (const type of TYPES) {
-      const existing = findType.get(type.name);
-      if (existing) {
-        typeIds.set(type.name, Number(existing.id));
+      const existing = await client.query('SELECT id FROM types WHERE LOWER(name) = LOWER($1)', [
+        type.name,
+      ]);
+      if (existing.rows[0]) {
+        typeIds.set(type.name, Number(existing.rows[0].id));
         continue;
       }
-      const result = db
-        .prepare('INSERT INTO types (name, color, created_at) VALUES (?, ?, ?)')
-        .run(type.name, type.color, stamp);
-      typeIds.set(type.name, Number(result.lastInsertRowid));
+      const result = await client.query(
+        'INSERT INTO types (name, color, created_at) VALUES ($1, $2, $3) RETURNING id',
+        [type.name, type.color, stamp],
+      );
+      typeIds.set(type.name, Number(result.rows[0].id));
     }
 
     const productIds = [];
@@ -104,15 +106,14 @@ export function loadDemo() {
         Higiene: 'Conferir integridade da embalagem.',
         Congelados: 'Manter sob refrigeração adequada.',
       };
-      const result = db
-        .prepare(
-          `
-          INSERT INTO products
-            (name, sku, type_id, unit, price, initial_stock, min_stock, expires_on, notes, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        )
-        .run(
+      const result = await client.query(
+        `
+        INSERT INTO products
+          (name, sku, type_id, unit, price, initial_stock, min_stock, expires_on, notes, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING id
+      `,
+        [
           item.name,
           item.sku,
           typeIds.get(item.type),
@@ -124,19 +125,14 @@ export function loadDemo() {
           notesByType[item.type] ?? '',
           stamp,
           stamp,
-        );
-      productIds.push(Number(result.lastInsertRowid));
+        ],
+      );
+      productIds.push(Number(result.rows[0].id));
     }
 
     const stocks = PRODUCTS.map((product) => product.initial);
-    const insertMovement = db.prepare(
-      `
-      INSERT INTO movements (product_id, kind, quantity, unit_price, date, time, party, notes, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    );
 
-    const addMovement = (index, kind, quantity, date, time) => {
+    const addMovement = async (index, kind, quantity, date, time) => {
       const product = PRODUCTS[index];
       const party = kind === 'saida' ? pick(SAIDA_PARTIES) : pick(ENTRADA_PARTIES);
       const notes = kind === 'saida' ? pick(SAIDA_NOTES) : pick(ENTRADA_NOTES);
@@ -144,16 +140,12 @@ export function loadDemo() {
         kind === 'entrada'
           ? round2(product.price * (0.82 + random() * 0.08))
           : round2(product.price * (0.98 + random() * 0.04));
-      insertMovement.run(
-        productIds[index],
-        kind,
-        quantity,
-        price,
-        date,
-        time,
-        party,
-        notes,
-        stamp,
+      await client.query(
+        `
+        INSERT INTO movements (product_id, kind, quantity, unit_price, date, time, party, notes, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `,
+        [productIds[index], kind, quantity, price, date, time, party, notes, stamp],
       );
       stocks[index] += kind === 'entrada' ? quantity : -quantity;
     };
@@ -196,11 +188,11 @@ export function loadDemo() {
           const maxQty = Math.min(6, Math.max(1, Math.floor(stocks[index])));
           const quantity = randInt(1, Math.max(1, Math.min(maxQty, weekday === 5 ? 5 : 3)));
           if (isToday) {
-            addMovement(index, 'saida', quantity, date, todayTime());
+            await addMovement(index, 'saida', quantity, date, todayTime());
           } else {
             const hours = [8, 9, 9, 10, 10, 11, 12, 13, 14, 14, 15, 16, 17, 18];
             const hour = pick(hours);
-            addMovement(index, 'saida', quantity, date, `${pad(hour)}:${pad(randInt(0, 59))}`);
+            await addMovement(index, 'saida', quantity, date, `${pad(hour)}:${pad(randInt(0, 59))}`);
           }
         }
       }
@@ -212,10 +204,10 @@ export function loadDemo() {
           if (PRODUCTS[index].target !== undefined) continue;
           const quantity = randInt(10, 32);
           if (isToday) {
-            addMovement(index, 'entrada', quantity, date, todayTime());
+            await addMovement(index, 'entrada', quantity, date, todayTime());
           } else {
             const hour = randInt(8, 17);
-            addMovement(index, 'entrada', quantity, date, `${pad(hour)}:${pad(randInt(0, 59))}`);
+            await addMovement(index, 'entrada', quantity, date, `${pad(hour)}:${pad(randInt(0, 59))}`);
           }
         }
       }
@@ -224,7 +216,7 @@ export function loadDemo() {
     for (const [index, product] of PRODUCTS.entries()) {
       if (product.target === undefined) continue;
       if (stocks[index] <= 0) {
-        addMovement(
+        await addMovement(
           index,
           'entrada',
           randInt(3, 6),
@@ -234,8 +226,8 @@ export function loadDemo() {
       }
     }
 
-    setMeta('demo', '1');
-    setMeta('demo_seeded_at', stamp);
+    await setMeta('demo', '1', client);
+    await setMeta('demo_seeded_at', stamp, client);
   });
 
   return {
