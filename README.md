@@ -60,7 +60,7 @@ Variáveis de ambiente:
 | `DATABASE_URL` | obrigatória | Conexão Postgres. No Supabase, use a aba **Transaction pooler** (porta `6543`). |
 | `PORT` | `5174` | Porta do servidor local. |
 | `TRUST_PROXY` | desligado | Use `1` atrás de proxy HTTPS/Vercel para cookies seguros e IP real. |
-| `TZ` | hora do servidor | Use `America/Sao_Paulo` para datas e horários do Brasil. |
+| `APP_TIMEZONE` | `America/Sao_Paulo` | Fuso usado para datas e horários. O padrão já é o horário do Brasil. |
 | `SILMARA_ADMIN_NAME` | `Silmara` | Nome da administradora criada automaticamente quando não há conta. |
 | `SILMARA_ADMIN_PASSWORD` | vazio | Cria a conta inicial sem passar pela tela de setup. Use apenas na primeira execução e não versione esse valor. |
 | `APP_ORIGIN` | vazio | Origens extras permitidas para requisições, separadas por vírgula. |

@@ -10,6 +10,8 @@ if (!process.env.DATABASE_URL) {
   }
 }
 
+process.env.TZ = process.env.APP_TIMEZONE || 'America/Sao_Paulo';
+
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
   throw new Error('DATABASE_URL não configurada. Defina a conexão do Postgres/Supabase no .env.');
